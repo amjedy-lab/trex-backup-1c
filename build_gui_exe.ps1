@@ -7,7 +7,7 @@ invoke-ps2exe -inputFile (Join-Path $dir 'backup-1c-gui.ps1') `
               -outputFile $outExe `
               -iconFile (Join-Path $dir 'T-REX-backup.ico') `
               -title 'T-REX бэкап файловых баз 1С' `
-              -description 'T-REX бэкап файловых баз 1С v1.1 — GUI бэкапа файловых баз 1С (автор Валентин Суровцев, 2026)' `
+              -description 'T-REX бэкап файловых баз 1С v1.5 — GUI бэкапа файловых баз 1С (автор Валентин Суровцев, 2026)' `
               -product 'T-REX бэкап файловых баз 1С' `
               -sta -noConsole
 Write-Output ("built: " + (Get-Item $outExe).Length + " bytes")
