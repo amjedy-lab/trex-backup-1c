@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
     T-REX бэкап файловых баз 1С — GUI (WPF/XAML + PowerShell) для скрипта backup-1c.ps1.
-    Версия 1.4.0 · Автор: Валентин Суровцев, 2026.
+    Версия 1.5.0 · Автор: Валентин Суровцев, 2026.
 
     Работает в обеих редакциях: pwsh 7 и Windows PowerShell 5.1
     (exe от ps2exe исполняется движком 5.1, как у T-REX метронома).
@@ -28,7 +28,11 @@
     SQLite-база хранит всю историю). Код возврата: 0 — успех; 1 — фатальная ошибка
     запуска; 2 — есть неудачные базы; 3 — прогон прерван. Задачу Планировщика
     создаёт сама утилита: настройки (⚙) -> кнопка «Расписание…» — расписаний может
-    быть несколько (время + дни каждое), все они триггерами одной задачи.
+    быть несколько (время + дни каждое), все они триггерами одной задачи. Задача
+    регистрируется «для всех пользователей» без сохранения пароля (тип входа S4U)
+    и с наивысшими правами: такие параметры Планировщик принимает только от
+    повышенного процесса, поэтому при применении расписания появляется запрос UAC
+    (если сама утилита уже запущена от администратора — запроса не будет).
 
     SQLite-драйвер ВСТРОЕН в скрипт (блок ниже, генерируется make_embedded_sqlite.ps1):
     под pwsh 7 берётся сборка .NET Core, под 5.1/exe — .NET Framework; распаковка
@@ -91,7 +95,7 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $appDir 'config.json' }
 
 # --- Имя/версия приложения (единая точка для шапок, заголовков, задачи шедулера) ---
 $AppName      = 'T-REX бэкап файловых баз 1С'
-$AppVersion   = '1.4.0'
+$AppVersion   = '1.5.0'
 $AppTitle     = "$AppName v$AppVersion"
 $SchTaskName  = $AppName   # имя задачи Планировщика Windows для тихого бэкапа
 # Топик ntfy по умолчанию (личный канал уведомлений; URL и логин не вшиваем — они в личных записях)
@@ -13027,12 +13031,99 @@ function Get-BackupScheduleState {
     return ,$result
 }
 
+function New-ScheduleHelperCommand {
+    # скрипт повышенного помощника (запускается как powershell.exe -File <временный ps1>),
+    # параметры — JSON-строкой внутри скрипта: кириллица имени задачи и пробелы путей
+    # не ломаются ни при каком квотировании. UserId передаётся явно от ВЫЗЫВАЮЩЕГО
+    # процесса: UAC можно подтвердить и другим администратором, а задача обязана
+    # остаться от текущего пользователя
+    param([hashtable]$Config)   # Mode: register|unregister; TaskName, User, Execute,
+                                # Argument, WorkDir, Description, Triggers(@{Time;Days})
+
+    $cfgObj = [pscustomobject]@{
+        Mode        = [string]$Config.Mode
+        TaskName    = [string]$Config.TaskName
+        User        = [string]$Config.User
+        Execute     = [string]$Config.Execute
+        Argument    = [string]$Config.Argument
+        WorkDir     = [string]$Config.WorkDir
+        Description = [string]$Config.Description
+        Triggers    = @($Config.Triggers | ForEach-Object { [pscustomobject]@{ Time = [string]$_.Time; Days = @($_.Days) } })
+    }
+    $json = (ConvertTo-Json $cfgObj -Depth 5).Replace("'", "''")
+
+    $helperTemplate = @'
+$ErrorActionPreference = 'Stop'
+$c = '__TREX_JSON__' | ConvertFrom-Json
+if ($c.Mode -eq 'unregister') {
+    Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction Stop
+    exit 0
+}
+$action = New-ScheduledTaskAction -Execute $c.Execute -Argument $c.Argument -WorkingDirectory $c.WorkDir
+$triggers = @()
+foreach ($t in @($c.Triggers)) {
+    $at = [datetime]::ParseExact($t.Time, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+    if (@($t.Days | Sort-Object -Unique).Count -eq 7) {
+        $triggers += New-ScheduledTaskTrigger -Daily -At $at
+    }
+    else {
+        $dows = @($t.Days | ForEach-Object { [System.DayOfWeek]($_ % 7) })
+        $triggers += New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dows -At $at
+    }
+}
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId $c.User -LogonType S4U -RunLevel Highest
+Register-ScheduledTask -TaskName $c.TaskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Description $c.Description -Force -ErrorAction Stop | Out-Null
+exit 0
+'@
+    $helper = $helperTemplate.Replace('__TREX_JSON__', $json)
+    return $helper
+}
+
+function Invoke-ElevatedScheduleHelper {
+    # задача с S4U («для всех пользователей», пароль не сохраняется) и «с наивысшими
+    # правами» регистрируется ТОЛЬКО повышенным процессом (проверено: неповышенному
+    # процессу Планировщик отвечает «Отказано в доступе»), а утилита штатно работает
+    # без elevation — поэтому действие выполняет помощник, поднятый запросом UAC.
+    # ВАЖНО (поведенческий монитор антивирусов, проверено на Kaspersky
+    # PDM:Exploit.Win32.Generic): помощник — ОБЫЧНЫЙ запуск powershell.exe -File
+    # <временный ps1> с ВИДИМЫМ окном; скрытое окно и Base64-команда
+    # (-EncodedCommand) выглядят как эксплойт и блокируются. Скрипт — UTF-8 с BOM
+    # (кириллица имени задачи) в %TEMP%, после выполнения удаляется
+    param([hashtable]$Config)
+
+    $script = New-ScheduleHelperCommand -Config $Config
+    $tmp = Join-Path $env:TEMP ("trex_schedule_helper_{0}.ps1" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+    [IO.File]::WriteAllText($tmp, $script, (New-Object System.Text.UTF8Encoding($true)))
+    try {
+        $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $proc = Start-Process -FilePath $psExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $tmp) -Verb RunAs -Wait -PassThru
+    }
+    catch {
+        $m = $_.Exception.Message
+        if ($m -match 'canceled by the user|отменена пользователем') {
+            throw "Запрос UAC не подтверждён — параметры задачи не изменены."
+        }
+        throw
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+    }
+    if ($proc.ExitCode -ne 0) {
+        throw "Повышенный помощник завершился с кодом $($proc.ExitCode) — задача не обновлена."
+    }
+}
+
 function Set-BackupScheduleTask {
-    # каждое расписание становится своим триггером ОДНОЙ задачи шедулера
+    # каждое расписание становится своим триггером ОДНОЙ задачи шедулера.
+    # Параметры задачи по умолчанию (v1.5.0): «Выполнять для всех пользователей» +
+    # «Не сохранять пароль» (тип входа S4U) и «Выполнить с наивысшими правами»
+    # (RunLevel Highest). Если утилита сама запущена без elevation (штатно),
+    # регистрация уходит в UAC-помощника
     param([object[]]$Schedules)   # элементы: @{ Time = 'ЧЧ:ММ'; Days = @(1=Пн..7=Вс) }
 
     $launch = Get-SelfScheduleAction
-    $action = New-ScheduledTaskAction -Execute $launch.Execute -Argument $launch.Argument -WorkingDirectory $appDir
+    $description = "Тихий бэкап всех баз из config.json ($AppName v$AppVersion, автор Валентин Суровцев, 2026)"
     $triggers = @()
     foreach ($s in $Schedules) {
         $at = [datetime]::ParseExact($s.Time, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
@@ -13045,12 +13136,41 @@ function Set-BackupScheduleTask {
         }
     }
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $SchTaskName -Action $action -Trigger $triggers -Settings $settings `
-        -Description "Тихий бэкап всех баз из config.json ($AppName v$AppVersion, автор Валентин Суровцев, 2026)" -Force | Out-Null
+    $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType S4U -RunLevel Highest
+
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($elevated) {
+        # прямой путь — утилита запущена от администратора, запрос UAC не нужен
+        $action = New-ScheduledTaskAction -Execute $launch.Execute -Argument $launch.Argument -WorkingDirectory $appDir
+        Register-ScheduledTask -TaskName $SchTaskName -Action $action -Trigger $triggers -Settings $settings `
+            -Principal $principal -Description $description -Force | Out-Null
+    }
+    else {
+        Invoke-ElevatedScheduleHelper -Config @{
+            Mode        = 'register'
+            TaskName    = $SchTaskName
+            User        = $userId
+            Execute     = $launch.Execute
+            Argument    = $launch.Argument
+            WorkDir     = $appDir
+            Description = $description
+            Triggers    = $Schedules
+        }
+    }
 }
 
 function Remove-BackupScheduleTask {
-    Unregister-ScheduledTask -TaskName $SchTaskName -Confirm:$false -ErrorAction Stop
+    # удаление СВОЕЙ задачи elevation обычно не требует, но задача, созданная
+    # повышенным помощником, из неповышенного процесса может не удалиться —
+    # тогда повторяем через того же помощника
+    try {
+        Unregister-ScheduledTask -TaskName $SchTaskName -Confirm:$false -ErrorAction Stop
+    }
+    catch {
+        if ($_.Exception.Message -notmatch '0x80070005|E_ACCESSDENIED|Отказано в доступе|Access is denied') { throw }
+        Invoke-ElevatedScheduleHelper -Config @{ Mode = 'unregister'; TaskName = $SchTaskName }
+    }
 }
 
 # --- Диалог одного расписания: результат — $global:scheduleEditResult ---------------
@@ -13086,7 +13206,7 @@ function Apply-ScheduleList {
         $toRegister = @($Schedules | ForEach-Object { @{ Time = $_.Time; Days = $_.Days } })
         Set-BackupScheduleTask -Schedules $toRegister
         $Msg.Foreground = $BrushOk
-        $Msg.Text = "$What — задача обновлена: расписаний — $($Schedules.Count), тихий бэкап по указанным временам (запуск от текущего пользователя)."
+        $Msg.Text = "$What — задача обновлена: расписаний — $($Schedules.Count), тихий бэкап по указанным временам (задача: для всех пользователей, пароль не сохраняется, с наивысшими правами)."
         return $true
     }
     catch {
@@ -13164,7 +13284,7 @@ function Build-ScheduleWindow {
     if ($state) {
         foreach ($s in @($state)) { [void]$schedules.Add((New-ScheduleItem -Time $s.Time -Days $s.Days)) }
         $msg.Foreground = $brushOk
-        $msg.Text = "Задача «$SchTaskName» уже есть в Планировщике — список загружен из неё; действия со списком применяются к задаче сразу."
+        $msg.Text = "Задача «$SchTaskName» уже есть в Планировщике — список загружен из неё; действия со списком применяются к задаче сразу (при этом появится запрос UAC — так Планировщик принимает параметры «для всех пользователей» и «с наивысшими правами»)."
     }
     else {
         [void]$schedules.Add((New-ScheduleItem -Time '03:00' -Days @(1, 2, 3, 4, 5, 6, 7)))
